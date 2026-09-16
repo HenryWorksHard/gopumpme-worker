@@ -157,13 +157,17 @@ async function processPayouts(ops: Keypair) {
 }
 
 // Buy back $GPM with the ops wallet's accumulated USDC and burn it.
+// The mint comes from platform_config (single source of truth shared with the
+// web app), falling back to the GPM_MINT env if set.
 async function buybackAndBurn(ops: Keypair) {
-  if (!config.gpmMint) return;
+  const { data: cfg } = await db.from("platform_config").select("gpm_mint").eq("id", 1).single();
+  const gpmMint = ((cfg?.gpm_mint as string) || config.gpmMint || "").trim();
+  if (!gpmMint) return;
   const conn = connection();
   const usdc = await usdcBalance(ops.publicKey);
   if (usdc < 1 * 10 ** USDC_DECIMALS) return; // wait for at least ~$1
-  const gpm = new PublicKey(config.gpmMint);
-  const { outAmount, signature: buySig } = await usdcToGpm(conn, ops, usdc, config.gpmMint);
+  const gpm = new PublicKey(gpmMint);
+  const { outAmount, signature: buySig } = await usdcToGpm(conn, ops, usdc, gpmMint);
   const mintInfo = await getMint(conn, gpm);
   const ata = await getAssociatedTokenAddress(gpm, ops.publicKey);
   const burnTx = new Transaction().add(
