@@ -4,7 +4,7 @@ import {
   PublicKey,
   VersionedTransaction,
 } from "@solana/web3.js";
-import { USDC_MINT } from "./solana.js";
+import { USDC_MINT } from "./solana";
 
 const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
 const JUP_SWAP = "https://quote-api.jup.ag/v6/swap";

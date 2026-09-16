@@ -14,9 +14,9 @@ import {
 } from "@solana/spl-token";
 import { OnlinePumpSdk } from "@pump-fun/pump-sdk";
 import { createClient } from "@supabase/supabase-js";
-import { config } from "./config.js";
-import { connection, escrowKeypair, opsKeypair, USDC_MINT, LAMPORTS } from "./solana.js";
-import { solToUsdc, usdcToGpm } from "./jupiter.js";
+import { config } from "./config";
+import { connection, escrowKeypair, opsKeypair, USDC_MINT, LAMPORTS } from "./solana";
+import { solToUsdc, usdcToGpm } from "./jupiter";
 
 const db = createClient(config.supabaseUrl, config.supabaseSecret, {
   auth: { persistSession: false },

@@ -1,7 +1,7 @@
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { createDecipheriv } from "crypto";
 import bs58 from "bs58";
-import { config } from "./config.js";
+import { config } from "./config";
 
 export const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 export const LAMPORTS = 1_000_000_000;
