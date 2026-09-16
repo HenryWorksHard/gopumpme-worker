@@ -1,0 +1,28 @@
+{
+  "name": "gopumpme-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open fee-routing worker for GoPumpMe: claims pump.fun creator fees, swaps to USDC, pays charities, and buys back + burns $GPM.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "once": "tsx src/index.ts --once"
+  },
+  "dependencies": {
+    "@pump-fun/pump-sdk": "^1.36.0",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.4",
+    "@supabase/supabase-js": "^2.110.8",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.6",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": { "node": ">=20" }
+}
