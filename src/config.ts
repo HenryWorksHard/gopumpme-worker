@@ -19,6 +19,10 @@ export const config = {
   buybackBps: num("BUYBACK_BPS", 2000),
   minClaimSol: num("MIN_CLAIM_SOL", 0.02),
   solFeeBuffer: num("SOL_FEE_BUFFER", 0.01),
+  // Ops wallet always keeps this much SOL for gas; buyback never touches it.
+  gasReserveSol: num("GAS_RESERVE_SOL", 0.05),
+  // Don't fire a buyback swap until at least this much buyback SOL has pooled.
+  minBuybackSol: num("MIN_BUYBACK_SOL", 0.005),
   pollSeconds: num("POLL_SECONDS", 300),
   // Payout scheduling: minimum USD in a fund's escrow before a payout is queued
   // for the admin to donate on GoFundMe.

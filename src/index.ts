@@ -1,6 +1,7 @@
 import {
   Keypair,
   PublicKey,
+  SystemProgram,
   Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
@@ -16,7 +17,7 @@ import { OnlinePumpSdk } from "@pump-fun/pump-sdk";
 import { createClient } from "@supabase/supabase-js";
 import { config } from "./config";
 import { connection, escrowKeypair, opsKeypair, USDC_MINT, LAMPORTS } from "./solana";
-import { solToUsdc, usdcToGpm } from "./jupiter";
+import { solToUsdc, solToGpm } from "./jupiter";
 import { fetchGoFundMe } from "./gofundme";
 import { krakenConfigured, krakenBalance } from "./kraken";
 
@@ -58,8 +59,18 @@ async function transferToken(
   return sendAndConfirmTransaction(conn, tx, signers);
 }
 
-// One fund: claim accrued creator fees, swap to USDC, split 80/20, and pay out
-// if verified + over threshold.
+// Move native SOL from -> to (feePayer covers the tx fee so an empty `from` works).
+async function transferSol(from: Keypair, to: PublicKey, lamports: number, feePayer: Keypair) {
+  const conn = connection();
+  const tx = new Transaction().add(
+    SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports })
+  );
+  const signers = feePayer.publicKey.equals(from.publicKey) ? [from] : [feePayer, from];
+  return sendAndConfirmTransaction(conn, tx, signers);
+}
+
+// One fund: claim accrued creator fees, split the raw SOL 80/20, convert the 80%
+// charity leg to USDC (held in escrow), and pool the 20% SOL for the $GPM buyback.
 async function processFund(fund: any, ops: Keypair) {
   const conn = connection();
   const online = new OnlinePumpSdk(conn);
@@ -77,35 +88,48 @@ async function processFund(fund: any, ops: Keypair) {
   const claimSig = await sendAndConfirmTransaction(conn, claimTx, [ops, escrow]);
   log(`fund ${fund.slug}: claimed ~${(vaultLamports / LAMPORTS).toFixed(4)} SOL (${claimSig.slice(0, 8)})`);
 
-  // 3. swap the escrow's SOL (minus a fee buffer) to USDC
+  // 3. split the raw SOL FIRST (minus a fee buffer): 20% for the $GPM buyback,
+  //    80% for the charity. The split has to happen in SOL, before any USDC
+  //    conversion, so the buyback leg can buy $GPM directly with SOL (one hop)
+  //    instead of paying a needless SOL -> USDC -> $GPM round trip.
   const solBal = await conn.getBalance(escrowPk);
   const swappable = solBal - config.solFeeBuffer * LAMPORTS;
   if (swappable <= 0) return;
-  const { outAmount: usdcOut } = await solToUsdc(conn, escrow, swappable);
+  const buybackLamports = Math.floor((swappable * config.buybackBps) / 10000);
+  const charityLamports = swappable - buybackLamports;
 
-  // 4. split: 20% -> ops (buyback treasury), 80% stays in escrow for the charity
-  const buybackUsdc = Math.floor((usdcOut * config.buybackBps) / 10000);
-  const charityUsdc = usdcOut - buybackUsdc;
-  if (buybackUsdc > 0) {
-    await transferToken(escrow, USDC_MINT, USDC_DECIMALS, ops.publicKey, buybackUsdc, escrow).catch((e) =>
-      log(`fund ${fund.slug}: buyback transfer failed`, (e as Error).message)
-    );
+  // 4a. charity 80%: SOL -> USDC, kept in escrow (later swept to Kraken -> bank)
+  let charityUsd = 0;
+  if (charityLamports > 0) {
+    const { outAmount: usdcOut } = await solToUsdc(conn, escrow, charityLamports);
+    charityUsd = usdcOut / 10 ** USDC_DECIMALS;
   }
 
-  const charityUsd = charityUsdc / 10 ** USDC_DECIMALS;
+  // 4b. buyback 20%: move the SOL to the ops wallet, where it pools until the
+  //     buyback+burn step swaps it straight to $GPM. Ops pays the transfer fee.
+  let buybackSol = 0;
+  if (buybackLamports > 0) {
+    try {
+      await transferSol(escrow, ops.publicKey, buybackLamports, ops);
+      buybackSol = buybackLamports / LAMPORTS;
+    } catch (e) {
+      log(`fund ${fund.slug}: buyback SOL transfer failed`, (e as Error).message);
+    }
+  }
+
   // 5. ledger
   await db.from("fee_claims").insert({
     fund_id: fund.id,
     sol_claimed: vaultLamports / LAMPORTS,
     usdc_received: charityUsd,
-    buyback_usdc: buybackUsdc / 10 ** USDC_DECIMALS,
+    buyback_sol: buybackSol,
     tx_signature: claimSig,
   });
   await db
     .from("funds")
     .update({ raised_usdc: Number(fund.raised_usdc) + charityUsd })
     .eq("id", fund.id);
-  log(`fund ${fund.slug}: +$${charityUsd.toFixed(2)} to escrow, $${(buybackUsdc / 1e6).toFixed(2)} to buyback`);
+  log(`fund ${fund.slug}: +$${charityUsd.toFixed(2)} to escrow, ${buybackSol.toFixed(4)} SOL to buyback`);
 }
 
 // Schedule GoFundMe payouts. For each active fund whose escrow has accumulated
@@ -184,7 +208,8 @@ async function refreshGoFundMe() {
   }
 }
 
-// Buy back $GPM with the ops wallet's accumulated USDC and burn it.
+// Buy back $GPM with the pooled buyback SOL (the 20% split off from each claim)
+// and burn it. Buying with SOL directly is a single hop - $GPM trades against SOL.
 // The mint comes from platform_config (single source of truth shared with the
 // web app), falling back to the GPM_MINT env if set.
 async function buybackAndBurn(ops: Keypair) {
@@ -192,10 +217,21 @@ async function buybackAndBurn(ops: Keypair) {
   const gpmMint = ((cfg?.gpm_mint as string) || config.gpmMint || "").trim();
   if (!gpmMint) return;
   const conn = connection();
-  const usdc = await usdcBalance(ops.publicKey);
-  if (usdc < 1 * 10 ** USDC_DECIMALS) return; // wait for at least ~$1
+
+  // How much buyback SOL has pooled but isn't yet burned: recorded split-offs
+  // minus what previous buybacks already spent.
+  const { data: pending } = await db.rpc("pending_buyback_sol");
+  const pendingLamports = Math.floor(Number(pending || 0) * LAMPORTS);
+  if (pendingLamports <= 0) return;
+
+  // Never dip into the gas reserve - the ops wallet also pays for every claim
+  // and sweep - so cap the buy at whatever SOL is spare above that reserve.
+  const opsBal = await conn.getBalance(ops.publicKey);
+  const spendable = Math.min(pendingLamports, opsBal - Math.floor(config.gasReserveSol * LAMPORTS));
+  if (spendable < config.minBuybackSol * LAMPORTS) return;
+
   const gpm = new PublicKey(gpmMint);
-  const { outAmount, signature: buySig } = await usdcToGpm(conn, ops, usdc, gpmMint);
+  const { outAmount, signature: buySig } = await solToGpm(conn, ops, spendable, gpmMint);
   const mintInfo = await getMint(conn, gpm);
   const ata = await getAssociatedTokenAddress(gpm, ops.publicKey);
   const burnTx = new Transaction().add(
@@ -203,12 +239,12 @@ async function buybackAndBurn(ops: Keypair) {
   );
   const burnSig = await sendAndConfirmTransaction(conn, burnTx, [ops]);
   await db.from("buybacks").insert({
-    usdc_spent: usdc / 10 ** USDC_DECIMALS,
+    sol_spent: spendable / LAMPORTS,
     gpm_burned: outAmount,
     buy_signature: buySig,
     burn_signature: burnSig,
   });
-  log(`buyback: spent $${(usdc / 1e6).toFixed(2)}, burned ${outAmount} $GPM (${burnSig.slice(0, 8)})`);
+  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${outAmount} $GPM (${burnSig.slice(0, 8)})`);
 }
 
 async function tick() {
