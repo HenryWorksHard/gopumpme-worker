@@ -13,7 +13,7 @@ import {
   getAccount,
   getMint,
 } from "@solana/spl-token";
-import { OnlinePumpSdk } from "@pump-fun/pump-sdk";
+import { OnlinePumpSdk, PumpSdk, feeSharingConfigPda, type SharingConfig } from "@pump-fun/pump-sdk";
 import { createClient } from "@supabase/supabase-js";
 import { config } from "./config";
 import { connection, escrowKeypair, opsKeypair, USDC_MINT, LAMPORTS } from "./solana";
@@ -69,79 +69,170 @@ async function transferSol(from: Keypair, to: PublicKey, lamports: number, feePa
   return sendAndConfirmTransaction(conn, tx, signers);
 }
 
-// One fund: claim accrued creator fees, split the raw SOL 80/20, convert the 80%
-// charity leg to USDC (held in escrow), and pool the 20% SOL for the $Fund buyback.
-async function processFund(fund: any, ops: Keypair) {
-  const conn = connection();
-  const online = new OnlinePumpSdk(conn);
-  const escrow = escrowKeypair(fund.__key.encrypted_secret);
-  const escrowPk = escrow.publicKey;
+// Record one claim's split to the ledger (shared by the legacy and fee-sharing paths).
+async function recordClaim(fund: any, solClaimed: number, charityUsd: number, buybackSol: number, sig: string) {
+  await db.from("fee_claims").insert({
+    fund_id: fund.id,
+    sol_claimed: solClaimed,
+    usdc_received: charityUsd,
+    buyback_sol: buybackSol,
+    tx_signature: sig,
+  });
+  await db
+    .from("funds")
+    .update({ raised_usdc: Number(fund.raised_usdc) + charityUsd })
+    .eq("id", fund.id);
+}
 
-  // 1. how much is claimable across both vaults
+// LEGACY one-time drain: before we hand the creator role to a fee-sharing config,
+// claim whatever creator fees already accrued to the escrow's own vault and split
+// them the old way, so nothing strands on the escrow's creator vault. No-op for a
+// fresh coin (nothing has accrued yet).
+async function claimAndSplitLegacy(conn: ReturnType<typeof connection>, online: OnlinePumpSdk, fund: any, escrow: Keypair, ops: Keypair) {
+  const escrowPk = escrow.publicKey;
   const vault = await online.getCreatorVaultBalanceBothPrograms(escrowPk).catch(() => null);
   const vaultLamports = vault ? vault.toNumber() : 0;
   if (vaultLamports < config.minClaimSol * LAMPORTS) return;
 
-  // 2. claim (ops wallet pays the fee so an empty escrow still works)
   const claimIxs = await online.collectCoinCreatorFeeInstructions(escrowPk, ops.publicKey);
-  const claimTx = new Transaction().add(...claimIxs);
-  const claimSig = await sendAndConfirmTransaction(conn, claimTx, [ops, escrow]);
-  log(`fund ${fund.slug}: claimed ~${(vaultLamports / LAMPORTS).toFixed(4)} SOL (${claimSig.slice(0, 8)})`);
+  const claimSig = await sendAndConfirmTransaction(conn, new Transaction().add(...claimIxs), [ops, escrow]);
+  log(`fund ${fund.slug}: legacy-claimed ~${(vaultLamports / LAMPORTS).toFixed(4)} SOL before migration (${claimSig.slice(0, 8)})`);
 
-  // 3. split the raw SOL FIRST (minus a fee buffer): 20% for the $Fund buyback,
-  //    80% for the charity. The split has to happen in SOL, before any USDC
-  //    conversion, so the buyback leg can buy $Fund directly with SOL (one hop)
-  //    instead of paying a needless SOL -> USDC -> $Fund round trip.
   const solBal = await conn.getBalance(escrowPk);
   const swappable = solBal - config.solFeeBuffer * LAMPORTS;
   if (swappable <= 0) return;
   const buybackLamports = Math.floor((swappable * config.buybackBps) / 10000);
   const charityLamports = swappable - buybackLamports;
 
-  // 4a. charity 80%: SOL -> USDC, kept in escrow (later swept to Kraken -> bank)
   let charityUsd = 0;
   if (charityLamports > 0) {
-    const { outAmount: usdcOut } = await solToUsdc(conn, escrow, charityLamports);
-    charityUsd = usdcOut / 10 ** USDC_DECIMALS;
+    const { outAmount } = await solToUsdc(conn, escrow, charityLamports);
+    charityUsd = outAmount / 10 ** USDC_DECIMALS;
   }
-
-  // 4b. buyback 20%: move the SOL to the ops wallet, where it pools until the
-  //     buyback+burn step swaps it straight to $Fund. Ops pays the transfer fee.
   let buybackSol = 0;
   if (buybackLamports > 0) {
     try {
       await transferSol(escrow, ops.publicKey, buybackLamports, ops);
       buybackSol = buybackLamports / LAMPORTS;
     } catch (e) {
-      log(`fund ${fund.slug}: buyback SOL transfer failed`, (e as Error).message);
+      log(`fund ${fund.slug}: legacy buyback transfer failed`, (e as Error).message);
     }
   }
-
-  // 5. ledger
-  await db.from("fee_claims").insert({
-    fund_id: fund.id,
-    sol_claimed: vaultLamports / LAMPORTS,
-    usdc_received: charityUsd,
-    buyback_sol: buybackSol,
-    tx_signature: claimSig,
-  });
-  await db
-    .from("funds")
-    .update({ raised_usdc: Number(fund.raised_usdc) + charityUsd })
-    .eq("id", fund.id);
-  log(`fund ${fund.slug}: +$${charityUsd.toFixed(2)} to escrow, ${buybackSol.toFixed(4)} SOL to buyback`);
+  await recordClaim(fund, vaultLamports / LAMPORTS, charityUsd, buybackSol, claimSig);
+  log(`fund ${fund.slug}: legacy +$${charityUsd.toFixed(2)} to escrow, ${buybackSol.toFixed(4)} SOL to buyback`);
 }
 
-// Schedule GoFundMe payouts. For each active fund whose escrow has accumulated
-// enough, sweep the cause's USDC to Kraken (crypto -> USD -> your bank happens
-// there) and queue a pending payout for the admin to donate on GoFundMe and
-// upload the receipt. GATED: nothing moves until KRAKEN_AUTO_CONVERT is enabled
-// (after a supervised test) and a deposit address is set - so no real funds move
-// on an untested config.
+// Point a coin's fee-sharing config at the agent (ops) wallet, 100%. pump.fun then
+// shows the agent as the creator-rewards recipient. Only the escrow (the config
+// admin) can do this; it signs, ops pays gas.
+async function routeSharesToOps(conn: ReturnType<typeof connection>, sdk: PumpSdk, mint: PublicKey, escrow: Keypair, ops: Keypair, cfg: SharingConfig): Promise<SharingConfig> {
+  const opsShare = cfg.shareholders.length === 1 && cfg.shareholders[0].address.equals(ops.publicKey) && cfg.shareholders[0].shareBps === 10000;
+  if (opsShare) return cfg;
+  if (cfg.adminRevoked) {
+    log(`config ${mint.toBase58().slice(0, 8)} is locked with non-agent shares; leaving as-is`);
+    return cfg;
+  }
+  const updIx = await sdk.updateFeeShares({
+    authority: escrow.publicKey,
+    mint,
+    currentShareholders: cfg.shareholders.map((s) => s.address),
+    newShareholders: [{ address: ops.publicKey, shareBps: 10000 }],
+  });
+  const sig = await sendAndConfirmTransaction(conn, new Transaction().add(updIx), [ops, escrow]);
+  log(`migrate: routed 100% of ${mint.toBase58().slice(0, 8)} creator fees to the agent wallet (${sig.slice(0, 8)})`);
+  const info = await conn.getAccountInfo(feeSharingConfigPda(mint));
+  return info ? sdk.decodeSharingConfig(info) : cfg;
+}
+
+// Create the pump fee-sharing config for a coin (escrow is the current creator +
+// signs), then route 100% to the agent wallet. Creating it replaces the coin's
+// on-chain creator with the config PDA - future creator fees accrue to the config
+// vault and are paid out to shareholders via distributeCreatorFees.
+async function ensureFeeSharing(conn: ReturnType<typeof connection>, sdk: PumpSdk, mint: PublicKey, escrow: Keypair, ops: Keypair): Promise<boolean> {
+  const configPda = feeSharingConfigPda(mint);
+  const createIx = await sdk.createFeeSharingConfig({ creator: escrow.publicKey, mint, pool: null });
+  const sig = await sendAndConfirmTransaction(conn, new Transaction().add(createIx), [ops, escrow]);
+  log(`migrate: created fee-sharing config for ${mint.toBase58().slice(0, 8)} (${sig.slice(0, 8)})`);
+  const info = await conn.getAccountInfo(configPda);
+  if (!info) return false;
+  await routeSharesToOps(conn, sdk, mint, escrow, ops, sdk.decodeSharingConfig(info));
+  return true;
+}
+
+// Move any USDC sitting on a fund's escrow to the agent (ops) wallet - legacy
+// funds converted their charity leg inside the escrow; under fee sharing the agent
+// holds it, and payouts sweep from there. No-op once the escrow is empty.
+async function drainEscrowUsdc(conn: ReturnType<typeof connection>, escrow: Keypair, ops: Keypair) {
+  const bal = await usdcBalance(escrow.publicKey);
+  if (bal <= 0) return;
+  await transferToken(escrow, USDC_MINT, USDC_DECIMALS, ops.publicKey, bal, ops);
+  log(`drained ${(bal / 10 ** USDC_DECIMALS).toFixed(2)} USDC from escrow ${escrow.publicKey.toBase58().slice(0, 8)} to agent`);
+}
+
+// One fund. First sight: drain the escrow vault (legacy) and migrate the coin to a
+// fee-sharing config paying the agent wallet. Thereafter: distribute the config's
+// accrued creator fees to the agent (permissionless), split 80/20, convert the 80%
+// charity leg to USDC (held by the agent) and pool the 20% SOL for the $Fund buyback.
+async function processFund(fund: any, ops: Keypair) {
+  const conn = connection();
+  const online = new OnlinePumpSdk(conn);
+  const sdk = new PumpSdk();
+  const escrow = escrowKeypair(fund.__key.encrypted_secret);
+  const mint = new PublicKey(fund.__mint);
+  const configPda = feeSharingConfigPda(mint);
+
+  const cfgInfo = await conn.getAccountInfo(configPda);
+  if (!cfgInfo) {
+    await claimAndSplitLegacy(conn, online, fund, escrow, ops);
+    const ok = await ensureFeeSharing(conn, sdk, mint, escrow, ops);
+    if (ok) await drainEscrowUsdc(conn, escrow, ops);
+    return; // fees accrued after migration are distributed on the next tick
+  }
+
+  const cfg = await routeSharesToOps(conn, sdk, mint, escrow, ops, sdk.decodeSharingConfig(cfgInfo));
+
+  // 1. distributable creator fees now sit on the config's vault
+  const vault = await online.getCreatorVaultBalanceBothPrograms(configPda).catch(() => null);
+  const vaultLamports = vault ? vault.toNumber() : 0;
+  if (vaultLamports < config.minClaimSol * LAMPORTS) return;
+
+  // 2. distribute to shareholders (agent = 100%). Permissionless; ops pays gas.
+  const distIx = await sdk.distributeCreatorFees({ mint, sharingConfig: cfg, sharingConfigAddress: configPda });
+  let distSig: string;
+  try {
+    distSig = await sendAndConfirmTransaction(conn, new Transaction().add(distIx), [ops]);
+  } catch (e) {
+    log(`fund ${fund.slug}: distribute skipped - ${(e as Error).message}`);
+    return;
+  }
+  log(`fund ${fund.slug}: distributed ~${(vaultLamports / LAMPORTS).toFixed(4)} SOL to the agent (${distSig.slice(0, 8)})`);
+
+  // 3. split what the agent just received: 20% pooled for the $Fund buyback (stays
+  //    in ops as SOL), 80% converted to USDC (held by the agent for the payout).
+  const buybackLamports = Math.floor((vaultLamports * config.buybackBps) / 10000);
+  const charityLamports = vaultLamports - buybackLamports;
+  let charityUsd = 0;
+  if (charityLamports > 0) {
+    const { outAmount } = await solToUsdc(conn, ops, charityLamports);
+    charityUsd = outAmount / 10 ** USDC_DECIMALS;
+  }
+  const buybackSol = buybackLamports / LAMPORTS;
+
+  await recordClaim(fund, vaultLamports / LAMPORTS, charityUsd, buybackSol, distSig);
+  log(`fund ${fund.slug}: +$${charityUsd.toFixed(2)} agent USDC, ${buybackSol.toFixed(4)} SOL to buyback`);
+}
+
+// Schedule GoFundMe payouts. Under fee sharing every cause's charity USDC is held
+// by the agent (ops) wallet and tracked per-cause in the DB. For each active fund
+// that has accumulated enough, sweep that much USDC from the agent wallet to Kraken
+// (crypto -> USD -> your bank happens there) and queue a pending payout for the
+// admin to donate on GoFundMe and upload the receipt. GATED: nothing moves until
+// KRAKEN_AUTO_CONVERT is enabled (after a supervised test) and a deposit address is
+// set - so no real funds move on an untested config.
 async function schedulePayouts(ops: Keypair) {
   const { data: funds } = await db
     .from("funds")
-    .select("*, fund_escrow_keys(encrypted_secret)")
+    .select("*")
     .eq("status", "active")
     .not("gofundme_url", "is", null);
   for (const fund of funds || []) {
@@ -156,15 +247,13 @@ async function schedulePayouts(ops: Keypair) {
         continue;
       }
 
-      const key = Array.isArray(fund.fund_escrow_keys) ? fund.fund_escrow_keys[0] : fund.fund_escrow_keys;
-      if (!key) continue;
-      const escrow = escrowKeypair(key.encrypted_secret);
-      const bal = await usdcBalance(escrow.publicKey);
+      // the cause's USDC lives in the agent wallet (commingled, DB-tracked); sweep
+      // this cause's owed share of it to the Kraken deposit address (ops pays gas)
+      const bal = await usdcBalance(ops.publicKey);
       const amountRaw = Math.min(bal, Math.round(owed * 10 ** USDC_DECIMALS));
       if (amountRaw <= 0) continue;
 
-      // sweep the cause's USDC to the Kraken deposit address (ops pays gas)
-      const sig = await transferToken(escrow, USDC_MINT, USDC_DECIMALS, new PublicKey(config.krakenUsdcDepositAddress), amountRaw, ops);
+      const sig = await transferToken(ops, USDC_MINT, USDC_DECIMALS, new PublicKey(config.krakenUsdcDepositAddress), amountRaw, ops);
       const usd = amountRaw / 10 ** USDC_DECIMALS;
       await db.from("payouts").insert({
         fund_id: fund.id,
@@ -255,15 +344,16 @@ async function tick() {
   const ops = opsKeypair();
   const { data: funds } = await db
     .from("funds")
-    .select("*, coins!inner(creator_verified), fund_escrow_keys(encrypted_secret)")
+    .select("*, coins!inner(mint, creator_verified), fund_escrow_keys(encrypted_secret)")
     .eq("status", "active")
     .eq("coins.creator_verified", true);
 
   for (const fund of funds || []) {
     try {
       const key = Array.isArray(fund.fund_escrow_keys) ? fund.fund_escrow_keys[0] : fund.fund_escrow_keys;
-      if (!key) continue;
-      await processFund({ ...fund, __key: key }, ops);
+      const coin = Array.isArray(fund.coins) ? fund.coins[0] : fund.coins;
+      if (!key || !coin?.mint) continue;
+      await processFund({ ...fund, __key: key, __mint: coin.mint }, ops);
     } catch (e) {
       log(`fund error ${fund.slug}:`, (e as Error).message);
     }
