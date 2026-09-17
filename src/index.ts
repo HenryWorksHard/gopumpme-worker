@@ -320,20 +320,29 @@ async function buybackAndBurn(ops: Keypair) {
   if (spendable < config.minBuybackSol * LAMPORTS) return;
 
   const gpm = new PublicKey(gpmMint);
-  const { outAmount, signature: buySig } = await solToGpm(conn, ops, spendable, gpmMint);
-  const mintInfo = await getMint(conn, gpm);
+  const { signature: buySig } = await solToGpm(conn, ops, spendable, gpmMint);
+
+  // Burn whatever $Donate actually landed - slippage means it differs from the
+  // quote, and reading the balance also confirms the buy really settled.
   const ata = await getAssociatedTokenAddress(gpm, ops.publicKey);
+  const acc = await getAccount(conn, ata);
+  const burnAmt = acc.amount; // bigint, exact received
+  if (burnAmt <= 0n) {
+    log(`buyback: swap ${buySig.slice(0, 8)} settled with no $Donate to burn`);
+    return;
+  }
+  const mintInfo = await getMint(conn, gpm);
   const burnTx = new Transaction().add(
-    createBurnCheckedInstruction(ata, gpm, ops.publicKey, BigInt(outAmount), mintInfo.decimals)
+    createBurnCheckedInstruction(ata, gpm, ops.publicKey, burnAmt, mintInfo.decimals)
   );
   const burnSig = await sendAndConfirmTransaction(conn, burnTx, [ops]);
   await db.from("buybacks").insert({
     sol_spent: spendable / LAMPORTS,
-    gpm_burned: outAmount,
+    gpm_burned: Number(burnAmt),
     buy_signature: buySig,
     burn_signature: burnSig,
   });
-  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${outAmount} $Donate (${burnSig.slice(0, 8)})`);
+  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${burnAmt} $Donate (${burnSig.slice(0, 8)})`);
 }
 
 async function tick() {
@@ -368,7 +377,7 @@ async function tick() {
     lastPayoutRun = now;
     await schedulePayouts(ops).catch((e) => log("payout schedule error:", (e as Error).message));
   }
-  await buybackAndBurn(ops).catch((e) => log("buyback error:", (e as Error).message));
+  await buybackAndBurn(ops).catch((e) => log("buyback error:", e instanceof Error ? e.stack || e.message : String(e)));
 }
 
 let lastPayoutRun = 0;

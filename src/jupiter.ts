@@ -1,7 +1,6 @@
 import {
   Connection,
   Keypair,
-  PublicKey,
   VersionedTransaction,
 } from "@solana/web3.js";
 import { USDC_MINT } from "./solana";
@@ -13,15 +12,39 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 type Quote = { outAmount: string; [k: string]: unknown };
 
-async function getQuote(inputMint: string, outputMint: string, amount: number, slippageBps = 100): Promise<Quote> {
-  const url = `${JUP_QUOTE}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Jupiter quote failed (${res.status})`);
-  return res.json();
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// The free lite-api rate-limits hard, and the worker now fires many swaps per
+// tick (a charity leg per coin + the buyback), so retry 429/5xx with backoff.
+async function jup(url: string, init?: RequestInit, tries = 5): Promise<any> {
+  let lastErr: unknown = new Error("Jupiter request failed");
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, init);
+      if (res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`Jupiter ${res.status} (rate limited/unavailable)`);
+        await sleep(500 * (i + 1));
+        continue;
+      }
+      if (!res.ok) throw new Error(`Jupiter ${res.status}: ${(await res.text().catch(() => "")).slice(0, 140)}`);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      await sleep(500 * (i + 1));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-// Swaps `amountRaw` of inputMint into outputMint from `owner`'s wallet.
-// Returns the output amount (raw) and the tx signature.
+async function getQuote(inputMint: string, outputMint: string, amount: number, slippageBps: number): Promise<Quote> {
+  return jup(`${JUP_QUOTE}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`);
+}
+
+// Swaps `amountRaw` of inputMint into outputMint from `owner`'s wallet. Sends with
+// a real priority fee and re-broadcasts until the signature confirms (or 60s), so
+// it lands even when the RPC / network is congested. Returns the quote's expected
+// out amount and the signature; callers that need the exact received amount should
+// read the token account after this resolves.
 export async function swap(
   conn: Connection,
   owner: Keypair,
@@ -31,7 +54,7 @@ export async function swap(
   slippageBps = 100
 ): Promise<{ outAmount: number; signature: string }> {
   const quote = await getQuote(inputMint, outputMint, amountRaw, slippageBps);
-  const res = await fetch(JUP_SWAP, {
+  const built = await jup(JUP_SWAP, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -39,16 +62,29 @@ export async function swap(
       userPublicKey: owner.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: "auto",
+      prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: 3_000_000, priorityLevel: "veryHigh" } },
     }),
   });
-  if (!res.ok) throw new Error(`Jupiter swap build failed (${res.status})`);
-  const { swapTransaction } = await res.json();
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
+  if (!built.swapTransaction) throw new Error(`Jupiter returned no swapTransaction: ${JSON.stringify(built).slice(0, 140)}`);
+
+  const tx = VersionedTransaction.deserialize(Buffer.from(built.swapTransaction, "base64"));
   tx.sign([owner]);
-  const signature = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
-  await conn.confirmTransaction(signature, "confirmed");
-  return { outAmount: Number(quote.outAmount), signature };
+  const raw = tx.serialize();
+
+  const signature = await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 5 });
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await sleep(2500);
+    const st = await conn.getSignatureStatuses([signature]).catch(() => null);
+    const s = st?.value?.[0];
+    if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) {
+      if (s.err) throw new Error(`swap failed on-chain: ${JSON.stringify(s.err)}`);
+      return { outAmount: Number(quote.outAmount), signature };
+    }
+    // re-broadcast (same blockhash) to survive drops under congestion
+    await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 5 }).catch(() => {});
+  }
+  throw new Error(`swap not confirmed in 60s (${signature})`);
 }
 
 export function solToUsdc(conn: Connection, owner: Keypair, lamports: number) {
@@ -59,8 +95,8 @@ export function usdcToGpm(conn: Connection, owner: Keypair, usdcRaw: number, gpm
   return swap(conn, owner, USDC_MINT.toBase58(), gpmMint, usdcRaw);
 }
 
-// Buy $Donate directly with SOL (the 20% buyback leg). One hop - SOL is $Donate's quote
-// currency on pump.fun, so this is the deepest, cheapest route.
+// Buy $Donate directly with SOL (the 20% buyback leg). One hop against SOL. A wider
+// slippage than the charity leg because $Donate is a fresh, volatile coin.
 export function solToGpm(conn: Connection, owner: Keypair, lamports: number, gpmMint: string) {
-  return swap(conn, owner, SOL_MINT, gpmMint, lamports);
+  return swap(conn, owner, SOL_MINT, gpmMint, lamports, 300);
 }
