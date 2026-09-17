@@ -222,14 +222,13 @@ async function processFund(fund: any, ops: Keypair) {
   log(`fund ${fund.slug}: +$${charityUsd.toFixed(2)} agent USDC, ${buybackSol.toFixed(4)} SOL to buyback`);
 }
 
-// Schedule GoFundMe payouts. Under fee sharing every cause's charity USDC is held
-// by the agent (ops) wallet and tracked per-cause in the DB. For each active fund
-// that has accumulated enough, sweep that much USDC from the agent wallet to Kraken
-// (crypto -> USD -> your bank happens there) and queue a pending payout for the
-// admin to donate on GoFundMe and upload the receipt. GATED: nothing moves until
-// KRAKEN_AUTO_CONVERT is enabled (after a supervised test) and a deposit address is
-// set - so no real funds move on an untested config.
-async function schedulePayouts(ops: Keypair) {
+// Queue GoFundMe payouts - the agent moves NO money. Under fee sharing every
+// cause's charity USDC accumulates in the agent (ops) wallet and is tracked
+// per-cause in the DB. For each active fund owed at least the threshold, queue a
+// pending payout so it appears in /admin. You then convert the agent's USDC and
+// donate on the GoFundMe yourself, mark it sent + upload the receipt. (The old
+// auto-sweep to Kraken is intentionally removed.)
+async function schedulePayouts() {
   const { data: funds } = await db
     .from("funds")
     .select("*")
@@ -242,29 +241,20 @@ async function schedulePayouts(ops: Keypair) {
       const owed = Number(fund.raised_usdc) - Number(fund.paid_usdc) - pendingSum;
       if (owed < config.minPayoutUsd) continue;
 
-      if (!config.krakenAutoConvert || !config.krakenUsdcDepositAddress) {
-        log(`fund ${fund.slug}: $${owed.toFixed(2)} ready, but Kraken auto-convert is off - not scheduling`);
-        continue;
-      }
-
-      // the cause's USDC lives in the agent wallet (commingled, DB-tracked); sweep
-      // this cause's owed share of it to the Kraken deposit address (ops pays gas)
-      const bal = await usdcBalance(ops.publicKey);
-      const amountRaw = Math.min(bal, Math.round(owed * 10 ** USDC_DECIMALS));
-      if (amountRaw <= 0) continue;
-
-      const sig = await transferToken(ops, USDC_MINT, USDC_DECIMALS, new PublicKey(config.krakenUsdcDepositAddress), amountRaw, ops);
-      const usd = amountRaw / 10 ** USDC_DECIMALS;
-      await db.from("payouts").insert({
+      const usd = Math.round(owed * 100) / 100;
+      const { error } = await db.from("payouts").insert({
         fund_id: fund.id,
         amount_usdc: usd,
         method: "gofundme",
         destination: fund.gofundme_url,
-        kraken_ref: sig,
         status: "pending",
         scheduled_for: new Date().toISOString(),
       });
-      log(`fund ${fund.slug}: swept $${usd.toFixed(2)} USDC to Kraken, payout queued (${sig.slice(0, 8)})`);
+      if (error) {
+        log(`fund ${fund.slug}: payout queue FAILED - ${error.message}`);
+        continue;
+      }
+      log(`fund ${fund.slug}: payout queued $${usd.toFixed(2)} (convert + donate manually)`);
     } catch (e) {
       log(`schedule error ${fund.slug}:`, (e as Error).message);
     }
@@ -302,6 +292,7 @@ async function refreshGoFundMe() {
 // The mint comes from platform_config (single source of truth shared with the
 // web app), falling back to the GPM_MINT env if set.
 async function buybackAndBurn(ops: Keypair) {
+  if (!config.buybackEnabled) return; // ON HOLD - the 20% keeps pooling as SOL until re-enabled
   const { data: cfg } = await db.from("platform_config").select("gpm_mint").eq("id", 1).single();
   const gpmMint = ((cfg?.gpm_mint as string) || config.gpmMint || "").trim();
   if (!gpmMint) return;
@@ -389,7 +380,7 @@ async function tick() {
   }
   if (now - lastPayoutRun > config.payoutIntervalSeconds * 1000) {
     lastPayoutRun = now;
-    await schedulePayouts(ops).catch((e) => log("payout schedule error:", (e as Error).message));
+    await schedulePayouts().catch((e) => log("payout schedule error:", (e as Error).message));
   }
   await buybackAndBurn(ops).catch((e) => log("buyback error:", e instanceof Error ? e.stack || e.message : String(e)));
 }

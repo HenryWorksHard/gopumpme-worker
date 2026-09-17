@@ -17,6 +17,10 @@ export const config = {
   gpmMint: process.env.GPM_MINT || "",
   charityBps: num("CHARITY_BPS", 8000),
   buybackBps: num("BUYBACK_BPS", 2000),
+  // Buyback + burn is ON HOLD: paused unless BUYBACK_ENABLED=true. The 80/20
+  // split still happens, so the 20% keeps pooling as SOL in the ops wallet and
+  // will burn once re-enabled - nothing else is affected.
+  buybackEnabled: (process.env.BUYBACK_ENABLED || "").toLowerCase() === "true",
   minClaimSol: num("MIN_CLAIM_SOL", 0.02),
   solFeeBuffer: num("SOL_FEE_BUFFER", 0.01),
   // Ops wallet always keeps this much SOL for gas; buyback never touches it.
