@@ -59,7 +59,7 @@ export function usdcToGpm(conn: Connection, owner: Keypair, usdcRaw: number, gpm
   return swap(conn, owner, USDC_MINT.toBase58(), gpmMint, usdcRaw);
 }
 
-// Buy $Fund directly with SOL (the 20% buyback leg). One hop - SOL is $Fund's quote
+// Buy $Donate directly with SOL (the 20% buyback leg). One hop - SOL is $Donate's quote
 // currency on pump.fun, so this is the deepest, cheapest route.
 export function solToGpm(conn: Connection, owner: Keypair, lamports: number, gpmMint: string) {
   return swap(conn, owner, SOL_MINT, gpmMint, lamports);

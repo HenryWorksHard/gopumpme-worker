@@ -172,7 +172,7 @@ async function drainEscrowUsdc(conn: ReturnType<typeof connection>, escrow: Keyp
 // One fund. First sight: drain the escrow vault (legacy) and migrate the coin to a
 // fee-sharing config paying the agent wallet. Thereafter: distribute the config's
 // accrued creator fees to the agent (permissionless), split 80/20, convert the 80%
-// charity leg to USDC (held by the agent) and pool the 20% SOL for the $Fund buyback.
+// charity leg to USDC (held by the agent) and pool the 20% SOL for the $Donate buyback.
 async function processFund(fund: any, ops: Keypair) {
   const conn = connection();
   const online = new OnlinePumpSdk(conn);
@@ -207,7 +207,7 @@ async function processFund(fund: any, ops: Keypair) {
   }
   log(`fund ${fund.slug}: distributed ~${(vaultLamports / LAMPORTS).toFixed(4)} SOL to the agent (${distSig.slice(0, 8)})`);
 
-  // 3. split what the agent just received: 20% pooled for the $Fund buyback (stays
+  // 3. split what the agent just received: 20% pooled for the $Donate buyback (stays
   //    in ops as SOL), 80% converted to USDC (held by the agent for the payout).
   const buybackLamports = Math.floor((vaultLamports * config.buybackBps) / 10000);
   const charityLamports = vaultLamports - buybackLamports;
@@ -297,8 +297,8 @@ async function refreshGoFundMe() {
   }
 }
 
-// Buy back $Fund with the pooled buyback SOL (the 20% split off from each claim)
-// and burn it. Buying with SOL directly is a single hop - $Fund trades against SOL.
+// Buy back $Donate with the pooled buyback SOL (the 20% split off from each claim)
+// and burn it. Buying with SOL directly is a single hop - $Donate trades against SOL.
 // The mint comes from platform_config (single source of truth shared with the
 // web app), falling back to the GPM_MINT env if set.
 async function buybackAndBurn(ops: Keypair) {
@@ -333,7 +333,7 @@ async function buybackAndBurn(ops: Keypair) {
     buy_signature: buySig,
     burn_signature: burnSig,
   });
-  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${outAmount} $Fund (${burnSig.slice(0, 8)})`);
+  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${outAmount} $Donate (${burnSig.slice(0, 8)})`);
 }
 
 async function tick() {
@@ -395,7 +395,7 @@ async function krakenStartupCheck() {
 
 async function main() {
   const once = process.argv.includes("--once");
-  log(`GoPumpMe worker starting (poll ${config.pollSeconds}s, split ${config.charityBps / 100}/${config.buybackBps / 100})`);
+  log(`Donate worker starting (poll ${config.pollSeconds}s, split ${config.charityBps / 100}/${config.buybackBps / 100})`);
   await krakenStartupCheck();
   do {
     try {

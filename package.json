@@ -2,7 +2,7 @@
   "name": "gopumpme-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "Open fee-routing worker for GoPumpMe: claims pump.fun creator fees, swaps to USDC, pays charities, and buys back + burns $GPM.",
+  "description": "Open fee-routing worker for Donate: claims pump.fun creator fees, swaps to USDC, pays charities, and buys back + burns $Donate.",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

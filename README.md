@@ -1,6 +1,6 @@
-# GoPumpMe Fee Worker
+# Donate Fee Worker
 
-Open fee-routing for [GoPumpMe](https://gopumpmecoin.fun) — the charity launchpad where every coin's trading fees pay a real cause.
+Open fee-routing for [Donate](https://godonate.app) — the charity launchpad where every coin's trading fees pay a real cause.
 
 This service is intentionally public so anyone can verify exactly how money moves. It never holds custody beyond the moments it is executing a transfer, and every action it takes is written to a public on-chain ledger you can audit on the fund's page.
 
@@ -10,9 +10,9 @@ Every few minutes, for each launched or registered coin:
 
 1. **Claim** — collects the coin's accrued pump.fun creator fees (bonding-curve *and* PumpSwap AMM vaults) into that fund's on-chain escrow. The fund creator pays nothing; the ops wallet covers the claim fee.
 2. **Swap** — converts the claimed SOL into **USDC** so amounts are stable dollars.
-3. **Split** — **80% stays in the fund escrow** for the charity, **20% buys back and burns $GPM**.
+3. **Split** — **80% stays in the fund escrow** for the charity, **20% buys back and burns $Donate**.
 4. **Pay out** — once a verified charity's escrow passes its threshold, USDC is sent to the charity (crypto now; fiat-to-bank via our payment partner).
-5. **Burn** — the 20% is used to buy $GPM on the open market and permanently burn it.
+5. **Burn** — the 20% is used to buy $Donate on the open market and permanently burn it.
 
 ```
 pump.fun creator fees
@@ -21,7 +21,7 @@ pump.fun creator fees
    fund escrow ──swap──► USDC
         │
         ├─ 80% ─► charity  (USDC wallet, or fiat to bank)
-        └─ 20% ─► buy $GPM ─► burn
+        └─ 20% ─► buy $Donate ─► burn
 ```
 
 ## Fee routing is locked on-chain
