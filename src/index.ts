@@ -17,6 +17,7 @@ import { createClient } from "@supabase/supabase-js";
 import { config } from "./config";
 import { connection, escrowKeypair, opsKeypair, USDC_MINT, LAMPORTS } from "./solana";
 import { solToUsdc, usdcToGpm } from "./jupiter";
+import { fetchGoFundMe } from "./gofundme";
 
 const db = createClient(config.supabaseUrl, config.supabaseSecret, {
   auth: { persistSession: false },
@@ -106,52 +107,78 @@ async function processFund(fund: any, ops: Keypair) {
   log(`fund ${fund.slug}: +$${charityUsd.toFixed(2)} to escrow, $${(buybackUsdc / 1e6).toFixed(2)} to buyback`);
 }
 
-// Pay out verified funds whose escrow balance has passed the threshold (crypto
-// now; fiat is recorded pending for the offramp partner).
-async function processPayouts(ops: Keypair) {
+// Schedule GoFundMe payouts. For each active fund whose escrow has accumulated
+// enough, sweep the cause's USDC to Kraken (crypto -> USD -> your bank happens
+// there) and queue a pending payout for the admin to donate on GoFundMe and
+// upload the receipt. GATED: nothing moves until KRAKEN_AUTO_CONVERT is enabled
+// (after a supervised test) and a deposit address is set - so no real funds move
+// on an untested config.
+async function schedulePayouts(ops: Keypair) {
   const { data: funds } = await db
     .from("funds")
     .select("*, fund_escrow_keys(encrypted_secret)")
     .eq("status", "active")
-    .eq("owner_verified", true);
+    .not("gofundme_url", "is", null);
   for (const fund of funds || []) {
     try {
-      const owed = Number(fund.raised_usdc) - Number(fund.paid_usdc);
-      if (owed < Number(fund.next_threshold_usdc)) continue;
-      if (!fund.payout_destination) continue;
+      const { data: pend } = await db.from("payouts").select("amount_usdc").eq("fund_id", fund.id).eq("status", "pending");
+      const pendingSum = (pend || []).reduce((a, p) => a + Number(p.amount_usdc), 0);
+      const owed = Number(fund.raised_usdc) - Number(fund.paid_usdc) - pendingSum;
+      if (owed < config.minPayoutUsd) continue;
 
-      if (fund.payout_method === "fiat") {
-        await db.from("payouts").insert({
-          fund_id: fund.id,
-          amount_usdc: owed,
-          method: "fiat",
-          destination: fund.payout_destination,
-          status: "pending",
-        });
-        await db.from("funds").update({ paid_usdc: Number(fund.paid_usdc) + owed }).eq("id", fund.id);
-        log(`fund ${fund.slug}: $${owed.toFixed(2)} queued for fiat payout`);
+      if (!config.krakenAutoConvert || !config.krakenUsdcDepositAddress) {
+        log(`fund ${fund.slug}: $${owed.toFixed(2)} ready, but Kraken auto-convert is off - not scheduling`);
         continue;
       }
 
-      // crypto: send escrow USDC to the charity wallet
       const key = Array.isArray(fund.fund_escrow_keys) ? fund.fund_escrow_keys[0] : fund.fund_escrow_keys;
+      if (!key) continue;
       const escrow = escrowKeypair(key.encrypted_secret);
       const bal = await usdcBalance(escrow.publicKey);
       const amountRaw = Math.min(bal, Math.round(owed * 10 ** USDC_DECIMALS));
       if (amountRaw <= 0) continue;
-      const sig = await transferToken(escrow, USDC_MINT, USDC_DECIMALS, new PublicKey(fund.payout_destination), amountRaw, escrow);
+
+      // sweep the cause's USDC to the Kraken deposit address (ops pays gas)
+      const sig = await transferToken(escrow, USDC_MINT, USDC_DECIMALS, new PublicKey(config.krakenUsdcDepositAddress), amountRaw, ops);
+      const usd = amountRaw / 10 ** USDC_DECIMALS;
       await db.from("payouts").insert({
         fund_id: fund.id,
-        amount_usdc: amountRaw / 10 ** USDC_DECIMALS,
-        method: "crypto",
-        destination: fund.payout_destination,
-        tx_signature: sig,
-        status: "sent",
+        amount_usdc: usd,
+        method: "gofundme",
+        destination: fund.gofundme_url,
+        kraken_ref: sig,
+        status: "pending",
+        scheduled_for: new Date().toISOString(),
       });
-      await db.from("funds").update({ paid_usdc: Number(fund.paid_usdc) + amountRaw / 10 ** USDC_DECIMALS }).eq("id", fund.id);
-      log(`fund ${fund.slug}: paid $${(amountRaw / 1e6).toFixed(2)} to charity (${sig.slice(0, 8)})`);
+      log(`fund ${fund.slug}: swept $${usd.toFixed(2)} USDC to Kraken, payout queued (${sig.slice(0, 8)})`);
     } catch (e) {
-      log(`payout error ${fund.slug}:`, (e as Error).message);
+      log(`schedule error ${fund.slug}:`, (e as Error).message);
+    }
+  }
+}
+
+// Refresh cached GoFundMe display data (title/image/goal/raised) for active funds.
+async function refreshGoFundMe() {
+  const cutoff = new Date(Date.now() - config.gofundmeRefreshSeconds * 1000).toISOString();
+  const { data: funds } = await db
+    .from("funds")
+    .select("id, slug, gofundme_url, gofundme_synced_at")
+    .eq("status", "active")
+    .not("gofundme_url", "is", null);
+  for (const f of funds || []) {
+    try {
+      if (f.gofundme_synced_at && f.gofundme_synced_at > cutoff) continue;
+      const c = await fetchGoFundMe(f.gofundme_url as string);
+      if (!c) continue;
+      await db.from("funds").update({
+        gofundme_title: c.title ?? null,
+        gofundme_image: c.image ?? null,
+        gofundme_goal: c.goal ?? null,
+        gofundme_raised: c.raised ?? null,
+        gofundme_synced_at: new Date().toISOString(),
+      }).eq("id", f.id);
+    } catch (e) {
+      log(`gofundme refresh error ${f.slug}:`, (e as Error).message);
     }
   }
 }
@@ -204,9 +231,21 @@ async function tick() {
       log(`fund error ${fund.slug}:`, (e as Error).message);
     }
   }
-  await processPayouts(ops);
+
+  const now = Date.now();
+  if (now - lastGoFundMeRefresh > config.gofundmeRefreshSeconds * 1000) {
+    lastGoFundMeRefresh = now;
+    await refreshGoFundMe().catch((e) => log("gofundme refresh error:", (e as Error).message));
+  }
+  if (now - lastPayoutRun > config.payoutIntervalSeconds * 1000) {
+    lastPayoutRun = now;
+    await schedulePayouts(ops).catch((e) => log("payout schedule error:", (e as Error).message));
+  }
   await buybackAndBurn(ops).catch((e) => log("buyback error:", (e as Error).message));
 }
+
+let lastPayoutRun = 0;
+let lastGoFundMeRefresh = 0;
 
 async function main() {
   const once = process.argv.includes("--once");
