@@ -18,6 +18,7 @@ import { config } from "./config";
 import { connection, escrowKeypair, opsKeypair, USDC_MINT, LAMPORTS } from "./solana";
 import { solToUsdc, usdcToGpm } from "./jupiter";
 import { fetchGoFundMe } from "./gofundme";
+import { krakenConfigured, krakenBalance } from "./kraken";
 
 const db = createClient(config.supabaseUrl, config.supabaseSecret, {
   auth: { persistSession: false },
@@ -247,9 +248,29 @@ async function tick() {
 let lastPayoutRun = 0;
 let lastGoFundMeRefresh = 0;
 
+// Read-only Kraken auth check (no trade, no transfer) so we can confirm the keys
+// work from the logs without exposing any secret.
+async function krakenStartupCheck() {
+  if (!krakenConfigured()) {
+    log("Kraken: not configured (KRAKEN_API_KEY/SECRET unset)");
+    return;
+  }
+  try {
+    const bal = await krakenBalance();
+    const usd = Number(bal.ZUSD || bal.USD || 0);
+    const usdc = Number(bal.USDC || 0);
+    log(
+      `Kraken: auth OK - USD $${usd.toFixed(2)}, USDC ${usdc.toFixed(2)} | auto-convert ${config.krakenAutoConvert} | deposit ${config.krakenUsdcDepositAddress ? "set" : "UNSET"} | bank key ${config.krakenBankWithdrawKey ? "set" : "UNSET"}`
+    );
+  } catch (e) {
+    log(`Kraken: auth FAILED - ${(e as Error).message}`);
+  }
+}
+
 async function main() {
   const once = process.argv.includes("--once");
   log(`GoPumpMe worker starting (poll ${config.pollSeconds}s, split ${config.charityBps / 100}/${config.buybackBps / 100})`);
+  await krakenStartupCheck();
   do {
     try {
       await tick();
