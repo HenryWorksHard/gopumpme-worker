@@ -325,10 +325,20 @@ async function buybackAndBurn(ops: Keypair) {
   // Burn whatever $Donate actually landed - slippage means it differs from the
   // quote, and reading the balance also confirms the buy really settled.
   const ata = await getAssociatedTokenAddress(gpm, ops.publicKey);
-  const acc = await getAccount(conn, ata);
-  const burnAmt = acc.amount; // bigint, exact received
+  // Read the received balance with retries - the ATA can lag the swap on a
+  // load-balanced RPC (TokenAccountNotFoundError right after it lands).
+  let burnAmt = 0n;
+  for (let i = 0; i < 6; i++) {
+    try {
+      burnAmt = (await getAccount(conn, ata)).amount;
+      if (burnAmt > 0n) break;
+    } catch {
+      /* ATA not indexed on this node yet */
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
   if (burnAmt <= 0n) {
-    log(`buyback: swap ${buySig.slice(0, 8)} settled with no $Donate to burn`);
+    log(`buyback: swap ${buySig.slice(0, 8)} settled but $Donate not readable yet - burns next tick`);
     return;
   }
   const mintInfo = await getMint(conn, gpm);

@@ -62,6 +62,9 @@ export async function swap(
       userPublicKey: owner.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
+      // let Jupiter estimate + cap slippage (the fixed slippageBps was too tight
+      // for a fresh, volatile coin -> on-chain Custom 6001 slippage failures)
+      dynamicSlippage: { maxBps: 1500 },
       prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: 3_000_000, priorityLevel: "veryHigh" } },
     }),
   });
