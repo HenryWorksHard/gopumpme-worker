@@ -33,7 +33,12 @@ export const config = {
   // run a supervised test - the scheduler still queues payouts without it.
   krakenApiKey: process.env.KRAKEN_API_KEY || "",
   krakenApiSecret: process.env.KRAKEN_API_SECRET || "",
+  // The withdrawal method tied to this key determines speed + fee. Set it to your
+  // INSTANT bank-transfer method in Kraken's Funding page so payouts land fast.
+  // That method charges a flat fee (~$50); it's disclosed on the site so the gap
+  // between raised and donated reads as a transfer cost, not a platform cut.
   krakenBankWithdrawKey: process.env.KRAKEN_BANK_WITHDRAW_KEY || "",
+  krakenInstantFeeUsd: num("KRAKEN_INSTANT_FEE_USD", 50),
   // Your Kraken USDC (Solana) deposit address, copied from Kraken's Funding page.
   // Escrow USDC is swept here when auto-convert is on.
   krakenUsdcDepositAddress: process.env.KRAKEN_USDC_DEPOSIT_ADDRESS || "",
