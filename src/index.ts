@@ -70,7 +70,7 @@ async function transferSol(from: Keypair, to: PublicKey, lamports: number, feePa
 }
 
 // One fund: claim accrued creator fees, split the raw SOL 80/20, convert the 80%
-// charity leg to USDC (held in escrow), and pool the 20% SOL for the $GPM buyback.
+// charity leg to USDC (held in escrow), and pool the 20% SOL for the $Fund buyback.
 async function processFund(fund: any, ops: Keypair) {
   const conn = connection();
   const online = new OnlinePumpSdk(conn);
@@ -88,10 +88,10 @@ async function processFund(fund: any, ops: Keypair) {
   const claimSig = await sendAndConfirmTransaction(conn, claimTx, [ops, escrow]);
   log(`fund ${fund.slug}: claimed ~${(vaultLamports / LAMPORTS).toFixed(4)} SOL (${claimSig.slice(0, 8)})`);
 
-  // 3. split the raw SOL FIRST (minus a fee buffer): 20% for the $GPM buyback,
+  // 3. split the raw SOL FIRST (minus a fee buffer): 20% for the $Fund buyback,
   //    80% for the charity. The split has to happen in SOL, before any USDC
-  //    conversion, so the buyback leg can buy $GPM directly with SOL (one hop)
-  //    instead of paying a needless SOL -> USDC -> $GPM round trip.
+  //    conversion, so the buyback leg can buy $Fund directly with SOL (one hop)
+  //    instead of paying a needless SOL -> USDC -> $Fund round trip.
   const solBal = await conn.getBalance(escrowPk);
   const swappable = solBal - config.solFeeBuffer * LAMPORTS;
   if (swappable <= 0) return;
@@ -106,7 +106,7 @@ async function processFund(fund: any, ops: Keypair) {
   }
 
   // 4b. buyback 20%: move the SOL to the ops wallet, where it pools until the
-  //     buyback+burn step swaps it straight to $GPM. Ops pays the transfer fee.
+  //     buyback+burn step swaps it straight to $Fund. Ops pays the transfer fee.
   let buybackSol = 0;
   if (buybackLamports > 0) {
     try {
@@ -208,8 +208,8 @@ async function refreshGoFundMe() {
   }
 }
 
-// Buy back $GPM with the pooled buyback SOL (the 20% split off from each claim)
-// and burn it. Buying with SOL directly is a single hop - $GPM trades against SOL.
+// Buy back $Fund with the pooled buyback SOL (the 20% split off from each claim)
+// and burn it. Buying with SOL directly is a single hop - $Fund trades against SOL.
 // The mint comes from platform_config (single source of truth shared with the
 // web app), falling back to the GPM_MINT env if set.
 async function buybackAndBurn(ops: Keypair) {
@@ -244,7 +244,7 @@ async function buybackAndBurn(ops: Keypair) {
     buy_signature: buySig,
     burn_signature: burnSig,
   });
-  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${outAmount} $GPM (${burnSig.slice(0, 8)})`);
+  log(`buyback: spent ${(spendable / LAMPORTS).toFixed(4)} SOL, burned ${outAmount} $Fund (${burnSig.slice(0, 8)})`);
 }
 
 async function tick() {
