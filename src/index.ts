@@ -322,15 +322,19 @@ async function buybackAndBurn(ops: Keypair) {
   const gpm = new PublicKey(gpmMint);
   const { signature: buySig } = await solToGpm(conn, ops, spendable, gpmMint);
 
-  // Burn whatever $Donate actually landed - slippage means it differs from the
-  // quote, and reading the balance also confirms the buy really settled.
-  const ata = await getAssociatedTokenAddress(gpm, ops.publicKey);
+  // $Donate (like all new pump coins) is a Token-2022 mint, so derive the token
+  // program from the mint - the classic SPL ATA lookup misses the tokens the swap
+  // actually delivered. We then burn the whole $Donate balance the agent holds.
+  const gpmAcct = await conn.getAccountInfo(gpm);
+  if (!gpmAcct) return;
+  const tokenProgram = gpmAcct.owner;
+  const ata = await getAssociatedTokenAddress(gpm, ops.publicKey, false, tokenProgram);
   // Read the received balance with retries - the ATA can lag the swap on a
   // load-balanced RPC (TokenAccountNotFoundError right after it lands).
   let burnAmt = 0n;
   for (let i = 0; i < 6; i++) {
     try {
-      burnAmt = (await getAccount(conn, ata)).amount;
+      burnAmt = (await getAccount(conn, ata, undefined, tokenProgram)).amount;
       if (burnAmt > 0n) break;
     } catch {
       /* ATA not indexed on this node yet */
@@ -341,9 +345,9 @@ async function buybackAndBurn(ops: Keypair) {
     log(`buyback: swap ${buySig.slice(0, 8)} settled but $Donate not readable yet - burns next tick`);
     return;
   }
-  const mintInfo = await getMint(conn, gpm);
+  const mintInfo = await getMint(conn, gpm, undefined, tokenProgram);
   const burnTx = new Transaction().add(
-    createBurnCheckedInstruction(ata, gpm, ops.publicKey, burnAmt, mintInfo.decimals)
+    createBurnCheckedInstruction(ata, gpm, ops.publicKey, burnAmt, mintInfo.decimals, [], tokenProgram)
   );
   const burnSig = await sendAndConfirmTransaction(conn, burnTx, [ops]);
   await db.from("buybacks").insert({
